@@ -1,0 +1,585 @@
+<?php
+
+/**
+ * Implements hook_init.
+ */
+function wpc_rfi_forms_init () {
+  if (!path_is_admin(current_path())) {
+    drupal_add_js(drupal_get_path('module', 'wpc_rfi_forms') . '/js/wpc_rfi_forms.js');
+  }
+}
+
+/**
+ * implements hook_menu
+ */
+function wpc_rfi_forms_menu () {
+  // Admin configuration - Settings.
+  $items['admin/config/services/lead_source'] = array (
+    'title'            => 'Lead Source Configuration Form',
+    'description'      => 'Setup the lead sources for RFI webform',
+    'page callback'    => 'drupal_get_form',
+    'page arguments' => array('wpc_rfi_forms_lead_source_config_form'),
+    'access arguments' => array ('administer site configuration'),
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_webform_submission_insert.
+ */
+function wpc_rfi_forms_webform_submission_insert ($node, $submission) {
+
+  $webform_components = $node->webform['components'];
+  $ps_acad_plan_key = _wpc_rfi_forms_item_key($webform_components, 'PS_Acad_Plan');
+
+  /*
+   * Set the Program Type based on the Program of Interest. Right now, it
+   * becomes undergraduate if the user selects Undergraduate in the program of
+   * interest.
+   */
+  if ($submission->data[$ps_acad_plan_key][0] != 'Undergraduate') {
+    $program_type = "Graduate";
+  }
+  else {
+    $program_type = "Undergraduate";
+  }
+
+  // Define important fields.
+  $importantFields = array (
+    'PS_Acad_Plan'     => array (
+      'name'  => 'PS_Acad_Plan',
+      'value' => $submission->data[$ps_acad_plan_key][0],
+    ),
+    'program_type'     => array (
+      'name'  => 'Program Type',
+      'value' => $program_type,
+    ),
+    'program_interest' => array (
+      'name'  => 'Program of Interest',
+      'value' => $submission->data[$ps_acad_plan_key][0],
+    ),
+  );
+
+
+  //Log if submission is missing important fields.
+  foreach ($importantFields as $key => $value) {
+    if (empty($value['value'])) {
+      watchdog('Webform', 'Webform Submission is missing !name', array ('!name' => $value['name']), WATCHDOG_WARNING, '<a href="' . $GLOBALS['base_url'] . '/node/' . $submission->nid . '/submission/' . $submission->sid . '">View Submission</a>');
+    }
+  }
+
+  //Send to Salesforce if the program_type is graduate, or if it's not Undergrdaduate and the Program of Interest isn't empty.
+  if ($importantFields['program_type']['value'] == 'Graduate' || ($importantFields['program_interest']['value'] !== "Undergraduate" && !empty($importantFields['program_interest']['value']))) {
+
+
+    /**
+     * Step 1 - Check if the form is already enabled to send to saleforce.
+     */
+
+    //Grab sfweb2lead_webform database table setting for current node.
+    $node_sfweb2lead_settings = db_select('sfweb2lead_webform', 's')
+      ->fields('s', array ('active', 'lead_source'))
+      ->condition('vid', $node->vid)
+      ->execute()->fetchAssoc();
+
+    //If Submit to SalesForce is enabled on the form, discontinue submitting the form since it would just duplicate the submission.
+    if ($node_sfweb2lead_settings['active'] == TRUE) {
+      watchdog('Webform', 'Submit to SalesForce" was enabled during this submission. Please disable the option to ensure proper submission processing. ', NULL, WATCHDOG_WARNING, '<a href="' . $GLOBALS['base_url'] . '/node/' . $submission->nid . '/submission/' . $submission->sid . '">View Submission</a>');
+      return;
+    }
+
+    /**
+     * Step 2 - Clone the $node to modify certain values for a send.
+     */
+
+    //Begin by cloning the node;
+    $fake_submit_node = clone $node;
+
+    /**
+     * Step 3 - Append custom sfweb2lead values to the node.
+     */
+
+    //Grab sfweb2lead_webform database table setting for current node.
+    $sfweb2lead_webform_custom_settings = db_select('sfweb2lead_webform', 's')
+      ->fields('s', array ('active', 'lead_source'))
+      ->condition('vid', '0')
+      ->execute()->fetchAssoc();
+
+    //Check if custom setting is available, if it doesn't run function that create it.
+    if (!empty($sfweb2lead_webform_custom_settings)) {
+      $fake_submit_node->vid = '0';
+    }
+    else {
+      sfweb2lead_custom_values();
+      $fake_submit_node->vid = '0';
+    }
+    /**
+     * Step 4 - Submit it to sfweb2lead_webform
+     */
+
+    //Check if sfweb2lead_webform module exist before calling the function.
+    if (module_exists('sfweb2lead_webform')) {
+
+      //Pass the submission to sfweb2lead_webform.
+      sfweb2lead_webform_webform_submission_insert($fake_submit_node, $submission);
+    }
+    else {
+      //Log any submissions that it didn't get processed.
+      watchdog('Webform', 'Graduate Webform wasn\'t processed. Contact your web admin to troubleshoot the issue', NULL, WATCHDOG_CRITICAL, '<a href="' . $GLOBALS['base_url'] . '/node/' . $submission->nid . '/submission/' . $submission->sid . '">View Submission</a>');
+    }
+
+  }
+  elseif ($importantFields['program_type']['value'] == 'Undergraduate' || $importantFields['program_interest']['value'] == 'Undergraduate') {
+
+    /**
+     * Trigger an email send if the user selects Undergrad for Program of Interest
+     */
+    module_load_include('inc', 'webform', 'includes/webform.submissions');
+    $output = webform_submission_render($node, $submission, NULL, 'text');
+    $output = drupal_render($output);
+    $from = variable_get('site_mail', '');
+    $language = language_default();
+    $params = array (
+      'subject' => 'New Undergraduate submission',
+      'body'    => array ($output),
+    );
+    if (in_array($_SERVER['PANTHEON_ENVIRONMENT'], array ('test', 'live'))) {
+      $to_address = 'wpcadmissions@asu.edu';
+    }
+    else {
+
+      $to_address = 'donald.overton@asu.edu';
+    }
+    
+    $message = drupal_mail('wpc_rfi_forms', 'undergrad_email', $to_address, $language, $params, $from, FALSE);
+    $message['subject'] = $params['subject'];
+    $message['body'] = $params['body'];
+    $system = drupal_mail_system('wpc_rfi_forms', 'undergrad_email');
+    $message = $system->format($message);
+    $message['result'] = $system->mail($message);
+    watchdog('Webform', 'Undergraduate Webform submission was sent to wpcadmissions@asu.edu.', NULL, WATCHDOG_NOTICE, '<a href="' . $GLOBALS['base_url'] . '/node/' . $submission->nid . '/submission/' . $submission->sid . '">View Submission</a>');
+  }
+  elseif (empty($importantFields['program_type'] ['value']) && empty($importantFields['program_interest'] ['value'])) {
+    watchdog('Webform', 'Webform submission was missing both Program Type and Program of Interest. If this was Undergraduate submission, the email to wpcadmissions@asu.edu did not fire.', NULL, WATCHDOG_WARNING, '<a href="' . $GLOBALS['base_url'] . '/node/' . $submission->nid . '/submission/' . $submission->sid . '">View Submission</a>');
+  }
+  else {
+    watchdog('Webform', 'Webform wasn\'t processed. Contact your web admin to troubleshoot the issue', NULL, WATCHDOG_CRITICAL, '<a href="' . $GLOBALS['base_url'] . '/node/' . $submission->nid . '/submission/' . $submission->sid . '">View Submission</a>');
+  }
+
+}
+
+function sfweb2lead_custom_values () {
+  //Create a Custom entry in the sfweb2lead_webform database table, to trigger manual submissions.
+  $record['vid'] = '0';
+  $record['active'] = 1;
+  $record['lead_source'] = 'Paid';
+  // Store the Webform SalesForce settings.
+  $query = db_merge('sfweb2lead_webform')
+    ->key(array ('vid' => $record['vid']))
+    ->fields($record)
+    ->execute();
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function wpc_rfi_forms_form_alter (&$form, &$form_state, $form_id) {
+  //get the form node id, since we will not know what the node id will be before hand
+  $request_for_information_form = _wpc_rfi_forms_get_request_information_node_id();
+
+
+  //just add styles to the request more information webform
+  if (!empty($request_for_information_form) && $form_id == "webform_client_form_$request_for_information_form->nid") {
+
+    $form_classes = array(
+      'row',
+    );
+    $form['#attributes']['class'] = array_merge($form['#attributes']['class'],$form_classes);
+
+    //add the class to the submit button
+    $existing_classes = $form['actions']['submit']['#attributes']['class'];
+    $new_classes = array (
+      'btn',
+      'btn-primary',
+      'btn-lg',
+    );
+
+    $form['actions']['submit']['#attributes']['class'] = array_merge($existing_classes, $new_classes);
+
+    $form['actions']['submit']['#prefix'] = '<div class="form-group col-sm-12 col-lg-6 col-lg-offset-3">';
+    $form['actions']['submit']['#suffix'] = '</div>';
+
+    $form['submitted']['Campus']['#access'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_webform_submission_presave().
+ */
+function wpc_rfi_forms_webform_submission_presave ($node, &$submission) {
+
+  //This is for the request for information form only
+  if ($node->title == 'Request more information') {
+
+    $redirect_academic_program = '';
+
+    //reads the cookie and sets the values base on the cookie
+    if (isset($_COOKIE["utm_medium"])) {
+      $secondary_lead_source = check_plain(urldecode($_COOKIE["utm_medium"]));
+    }
+    else {
+      $secondary_lead_source = 'Web Direct';
+    };
+
+    if ($secondary_lead_source == 'PANTHEON_STRIPPED'){
+      $secondary_lead_source = 'Unknown';
+    }
+
+    if (isset($_COOKIE["utm_source"])) {
+      $tertiary_lead_source = check_plain(urldecode($_COOKIE["utm_source"]));
+    }
+    else {
+      $tertiary_lead_source = 'None';
+    }
+
+    if($tertiary_lead_source == 'PANTHEON_STRIPPED'){
+      $tertiary_lead_source = "None";
+    }
+
+    if (isset($_COOKIE["utm_campaign"])) {
+      $campaign_id = check_plain(urldecode($_COOKIE["utm_campaign"]));
+    }
+    else {
+      $campaign_id = '';
+    }
+
+    
+    //if the campaign id contains "ed-plus" set Campaign_ID and tertiary lead source 
+    if(strpos(strtolower($campaign_id), 'edplus') !== false){
+      $campaign_id = "7014u000001NGaE";
+      $tertiary_lead_source = "Other";
+     
+    //if the campaign is blank or does not start with 701  
+    }elseif($campaign_id =='' || substr($campaign_id, 0, 3) != '701' ){
+      $campaign_id = "70134000001CTaG";
+    }
+
+    if (isset($_COOKIE['landing_page'])) {
+      $landing_page = check_plain(urldecode($_COOKIE['landing_page']));
+      
+      //check to see if landing page is longer than 255, if so truncate.
+      if(strlen($landing_page) >= 255){
+        $landing_page = substr($landing_page,0,255);
+      }
+    }
+    else {
+      $landing_page = '';
+    }
+
+    if (isset($_COOKIE["keyword"])) {
+      $keywords = check_plain(urldecode($_COOKIE["keyword"]));
+    }
+    else {
+      $keywords = '';
+    }
+
+    if (isset($_COOKIE["referring"])) {
+      $referring_url = check_plain(urldecode($_COOKIE["referring"]));
+    }
+    else {
+      $referring_url = '';
+    }
+
+    if(isset($_COOKIE['enterpriseclientid'])){
+      $enterprise_client_id = check_plain(urldecode($_COOKIE['enterpriseclientid']));
+    }else{
+      $enterprise_client_id = '';
+    }
+
+    //Get the components to find the keys
+    $webform_components = $node->webform['components'];
+
+
+    $tertiary_lead_source_key = _wpc_rfi_forms_item_key($webform_components, 'Tertiary_Lead_Source');
+    //populate Tertiary_Lead_Source
+    $submission->data[$tertiary_lead_source_key][0] = $tertiary_lead_source;
+
+    $campaign_id_key = _wpc_rfi_forms_item_key($webform_components, 'Campaign_ID');
+    //if the value is set in the cookie use that value otherwise use the default
+    if (!empty($campaign_id)) {
+      $submission->data[$campaign_id_key][0] = $campaign_id;
+    }
+    // $submission->data[$campaign_id_key][0] = $campaign_id;
+
+    $lead_status_key = _wpc_rfi_forms_item_key($webform_components, 'Lead_Status');
+    //populate Lead_Status
+    $submission->data[$lead_status_key][0] = "Open - New";
+
+    /**
+     * if the redirect url param is set read the value from the webform redirect
+     * location. This will allow set custom redirect pages for a webform. If the
+     * param is set, use the hardcoded value for the individual program. This
+     * was done using arrays to have one switch statement below.
+     */
+    $confirmation_url_params = explode('?', $node->webform['redirect_url']);
+    //parses the params and the result goes into confirmation_url_vars
+    parse_str($confirmation_url_params[1], $confirmation_url_vars);
+    $campus_key = _wpc_rfi_forms_item_key($webform_components, 'Campus');
+
+    //Setup redirects
+    $path = request_path();
+
+    $special_landing_pages = array('mba-programs/women','mba-programs/military');
+
+
+    $ps_acad_plan_descr_key = _wpc_rfi_forms_item_key($webform_components, 'PS_Acad_Plan_Descr');
+    $ps_acad_plan_key       = _wpc_rfi_forms_item_key($webform_components, 'PS_Acad_Plan');
+
+    if(!empty($confirmation_url_vars['redirect']) && $confirmation_url_vars['redirect'] == 'true'){
+      $redirect_campus = "Tempe";
+    }else if(!empty($submission->data[$campus_key][0])){
+      $redirect_campus = $submission->data[$campus_key][0];
+    }else{
+      $redirect_campus = "Tempe";
+    }
+
+    //Populate redirect URL and PS_Acad_Plan
+    switch ($submission->data[$ps_acad_plan_descr_key][0]) {
+      case "Accountancy":
+        $node->webform['redirect_url'] = "/masters-programs/accountancy/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAACCMACC';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Business Analytics":
+        $node->webform['redirect_url'] = "/masters-programs/business-analytics/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BABUSANMS';
+        $submission->data[$campus_key][0] ="Tempe";
+        break;
+      case "Business Analytics-Online":
+        $node->webform['redirect_url'] = "/masters-programs/business-analytics/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BABUSANMS';
+        $submission->data[$campus_key][0] = "Online";
+        $submission->data[$ps_acad_plan_descr_key][0] = "Business Analytics";
+        break;
+
+      case "Business Analytics-LA":
+        $node->webform['redirect_url'] = "/masters-programs/business-analytics-los-angeles/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BABUSANMS';
+        $submission->data[$campus_key][0] = "Los Angeles";
+        $submission->data[$ps_acad_plan_descr_key][0] = "Business Analytics";
+        break;
+
+      case "Data Analytics":
+        $node->webform['redirect_url'] = "/data-analytics/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = "CPEDAC";
+        $submission->data[$campus_key][0] = "Online";
+        break;
+        
+      case "Finance":
+        $node->webform['redirect_url'] = "/masters-programs/finance/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAFINMS';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Global Logistics":
+        $node->webform['redirect_url'] = "/masters-programs/global-logistics/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAGLSMS';
+        $submission->data[$campus_key][0] = "West";
+        break;
+
+      case "Management":
+        $node->webform['redirect_url'] = "/masters-programs/management/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BACMRMS';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Information Systems Management":
+        $node->webform['redirect_url'] = "/masters-programs/information-technology/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAINFOMS';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+        
+      case "Information Systems Management - Online":
+        $node->webform['redirect_url'] = "/masters-programs/online-information-management/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAINFOMS';
+        $submission->data[$campus_key][0] = "Online";
+        $submission->data[$ps_acad_plan_descr_key][0] = "Information Systems Management";
+        break;
+
+        case "Innovation and Venture Develop":
+          $node->webform['redirect_url'] = "/masters-programs/innovation-venture-development/confirmation"; //Tempe
+          $submission->data[$ps_acad_plan_key][0] = 'HIIVDMS';
+          $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Real Estate Development":
+        $node->webform['redirect_url'] = "/masters-programs/real-estate-development/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'ARREMREDEV';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Taxation":
+        $node->webform['redirect_url'] = "/masters-programs/taxation/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BATAMTAX';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Tech Consulting":
+        $node->webform['redirect_url'] = "/tech-consulting/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = "CPETCC";
+        $submission->data[$campus_key][0] = "Online";
+        break;
+
+      case "W. P. Carey MBA - Prof Flex":
+        $node->webform['redirect_url'] = "/mba-programs/evening/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAEVENMBA';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "W. P. Carey MBA - Executive":
+        $node->webform['redirect_url'] = "/mba-programs/executive/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAEXECMBA';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "W. P. Carey MBA - Custom":
+        $node->webform['redirect_url'] = '/mba-programs/executive-egade/confirmation';
+        $submission->data[$ps_acad_plan_key][0] = 'BACORPMBA';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "W. P. Carey MBA - Full Time":
+        $node->webform['redirect_url'] = "/mba-programs/full-time/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAFULLMBA';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "W. P. Carey MBA - Online":
+        $node->webform['redirect_url'] = "/mba-programs/online/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAONLINMBA';
+        $submission->data[$campus_key][0] = "Online";
+        break;
+      
+      case "W. P. Carey MBA - Fast-Track":
+        $node->webform['redirect_url'] = "/mba-programs/fast-track/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'BAEVEAMBA';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+
+      case "Undergraduate":
+        $node->webform['redirect_url'] = "/undergraduate-degrees/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'Undergraduate';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      case "Undecided":
+        $node->webform['redirect_url'] = "/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = 'None';
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+      
+      case "Real Estate":
+        $node->webform['redirect_url'] = "graduate-certificates/real-estate/confirmation";
+        $submission->data[$ps_acad_plan_key][0] = "BAREAGRCT";
+        $submission->data[$campus_key][0] = "Tempe";
+        break;
+
+      default:
+        $node->webform['redirect_url'] = $_SERVER['REQUEST_URI'] . '/confirmation';
+    }
+
+    $first_name_key = _wpc_rfi_forms_item_key($webform_components, 'first_name');
+    $last_name_key = _wpc_rfi_forms_item_key($webform_components, 'last_name');
+    $email_key = _wpc_rfi_forms_item_key($webform_components, 'email');
+    $phone_key = _wpc_rfi_forms_item_key($webform_components, 'phone');
+
+    //append program, campus, email, first name, last name, phone, and academic plan to the url
+    $node->webform['redirect_url'] .= "?program=" . $submission->data[$ps_acad_plan_key][0] .
+      "&campus=" . $submission->data[$campus_key][0].
+      "&Email=" . urlencode($submission->data[$email_key][0]).
+      "&FirstName=". urlencode($submission->data[$first_name_key][0]).
+      "&LastName=". urlencode($submission->data[$last_name_key][0]).
+      "&Phone=".urlencode($submission->data[$phone_key][0]).
+      "&AcademicPlan=". urlencode($redirect_academic_program);
+
+    //format the phone and return only the numbers
+    $submission->data[$phone_key][0] = preg_replace('/\D+/', '', $submission->data[$phone_key][0]);
+
+    $keywords_key = _wpc_rfi_forms_item_key($webform_components, 'keywords');
+    //populate keywords
+    $submission->data[$keywords_key][0] = $keywords;
+
+    $referring_url_key = _wpc_rfi_forms_item_key($webform_components, 'referring_url');
+    //populate referring url
+    $submission->data[$referring_url_key][0] = $referring_url;
+
+    $landing_page_key = _wpc_rfi_forms_item_key($webform_components, 'landing_page_url');
+    //populate Landing Page
+    $submission->data[$landing_page_key][0] = $landing_page;
+
+    $enterprise_client_id_key = _wpc_rfi_forms_item_key($webform_components, 'enterpriseclientid__c');
+    $submission->data[$enterprise_client_id_key][0] = $enterprise_client_id;
+    
+    $wpc_rfi_lead_source_map = variable_get('wpc_rfi_lead_source_map');
+
+    $secondary_lead_source_key = _wpc_rfi_forms_item_key($webform_components, 'secondary_lead_source');
+
+    $lead_source = $wpc_rfi_lead_source_map[strtolower($secondary_lead_source)];
+ 
+    
+    //populate secondary lead source
+    $submission->data[$secondary_lead_source_key][0] = $secondary_lead_source;
+
+    $lead_source_key = _wpc_rfi_forms_item_key($webform_components, 'Lead_Source');
+    //populate lead source
+    $submission->data[$lead_source_key][0] = $lead_source;
+
+  }
+}
+
+function wpc_rfi_forms_lead_source_config_form(){
+
+  $form = array();
+
+  $form['options_description'] = array(
+    '#type' => 'item',
+    '#title' => t('Lead Source Fields Mapping Table'),
+    '#description' => t('Mapping table to map Key = Secondary Lead Source to Value = Primary Lead Source'),
+  );
+  $form['options'] = array(
+
+    '#type' => 'options',
+    '#key_type' => 'custom',
+    '#key_type_toggled' => TRUE,
+    '#limit' => 200,
+    '#optgroups' => FALSE,
+    '#options' => variable_get('wpc_rfi_lead_source_map'),
+    '#default_value_allowed' => FALSE,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => 'Save',
+  );
+  return $form;
+}
+
+function wpc_rfi_forms_lead_source_config_form_submit($form, &$form_state) {
+  $wpc_rfi_forms_lead_source_config_form_settings = array();
+  foreach ($form_state['values']['options']['options'] as $key => $value) {
+    if (!empty($key) && !empty($value)) {
+      $wpc_rfi_lead_source_map[$key] = $value;
+    }
+  }
+  variable_set('wpc_rfi_lead_source_map', $wpc_rfi_lead_source_map);
+
+  drupal_set_message(t('WPC RFI Lead Source Configuration Settings Saved!'));
+}
+
+function _wpc_rfi_forms_get_request_information_node_id () {
+  return db_select('node', 'n')
+    ->fields('n', array ('nid'))
+    ->condition('type', 'webform')
+    ->condition('title', 'Request more information')
+    ->execute()
+    ->fetch();
+
+}
+
+function _wpc_rfi_forms_item_key ($webfom_components, $form_key) {
+  foreach ($webfom_components as $key => $value) {
+    if ($value['form_key'] == $form_key) {
+      return $key;
+    }
+  }
+}

@@ -1,0 +1,9 @@
+name = WPC RFI Forms
+description = "Add JS and submit function to handle WPC Program Forms"
+package = WPC Custom
+core = 7.x
+version = 7.x-1.x
+
+stylesheets[all][] = css/wpc_rfi_forms.css
+
+scripts[] = js/jquery.cookie.js
